@@ -1,0 +1,9 @@
+venv/
+venv_mac/
+venv_windows_backup/
+build/
+dist/
+Output/
+__pycache__/
+*.pyc
+.DS_Store
