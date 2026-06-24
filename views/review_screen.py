@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QLabel,
     QLineEdit, QTextEdit, QComboBox, QPushButton, QScrollArea,
     QFormLayout, QFrame, QTableWidget, QTableWidgetItem, QHeaderView,
-    QMessageBox,
+    QMessageBox, QSizePolicy,
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor
@@ -16,7 +16,9 @@ from core.coa_model import (
     COADocument, TestResult, FIELD_LABELS,
     PassFail, Disposition, TestCategory,
 )
-from core.field_mapper import FieldConfidence
+from core.field_mapper import FieldConfidence, generate_batch_number
+
+PRODUCT_CATEGORIES = ["", "Botanical", "Vitamins", "Amino Acids", "Mineral"]
 
 CONF_COLORS = {
     "ok":       "#FFFFFF",
@@ -41,24 +43,31 @@ class ReviewScreen(QWidget):
         self._doc: COADocument | None = None
         self._conf: FieldConfidence = {}
         self._field_widgets: dict[str, QWidget] = {}
+        self._supplier_batch_no: str = ""
         self._init_ui()
 
     def _init_ui(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(20, 15, 20, 15)
+        root.setContentsMargins(12, 8, 12, 8)
         root.setSpacing(10)
+
+        header_block = QVBoxLayout()
+        header_block.setSpacing(4)
 
         title = QLabel("Review & Edit COA Data")
         title.setObjectName("ScreenTitle")
-        root.addWidget(title)
+        header_block.addWidget(title)
 
         legend = QLabel(
             "⬜ White = high confidence   🟡 Yellow = moderate (check)   🟠 Orange = low (review required)"
         )
         legend.setStyleSheet("font-size:11px; color:#666;")
-        root.addWidget(legend)
+        header_block.addWidget(legend)
+
+        root.addLayout(header_block)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         # ── Left: header fields ──────────────────────────────────────────────
         left = QWidget()
@@ -68,6 +77,7 @@ class ReviewScreen(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         form_w = QWidget()
         self._form = QFormLayout(form_w)
         self._form.setSpacing(7)
@@ -78,6 +88,7 @@ class ReviewScreen(QWidget):
         # Build form rows
         self._add_section("Product Identification")
         self._add_field("product_name", required=True)
+        self._add_category_row()
         self._add_field("lot_number", required=True)
         self._add_field("internal_item_code")
         self._add_field("supplier_product_code")
@@ -85,7 +96,7 @@ class ReviewScreen(QWidget):
         self._add_field("purchase_order_number")
 
         self._add_section("Manufacturer / Supplier")
-        self._add_field("manufacturer_name", required=True)
+        self._add_field("manufacturer_name")
         self._add_field("manufacturer_address", multi=True)
         self._add_field("manufacturer_country")
         self._add_field("supplier_name")
@@ -116,9 +127,10 @@ class ReviewScreen(QWidget):
         right_layout.addWidget(tr_label)
 
         self._table = QTableWidget()
+        self._table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._table.setColumnCount(7)
         self._table.setHorizontalHeaderLabels(
-            ["Test Name", "Category", "Specification", "Result", "Unit", "Method", "Pass/Fail"]
+            ["Analysis Item", "Category", "Specification", "Result", "Unit", "Method", "Pass/Fail"]
         )
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self._table.horizontalHeader().setStretchLastSection(True)
@@ -146,7 +158,7 @@ class ReviewScreen(QWidget):
 
         splitter.addWidget(right)
         splitter.setSizes([380, 500])
-        root.addWidget(splitter)
+        root.addWidget(splitter, 1)
 
         # Bottom action bar
         bottom_row = QHBoxLayout()
@@ -178,6 +190,28 @@ class ReviewScreen(QWidget):
         self._field_widgets[field_key] = w
         self._form.addRow(label_text, w)
 
+    def _add_category_row(self):
+        combo = QComboBox()
+        combo.addItems(PRODUCT_CATEGORIES)
+        combo.currentTextChanged.connect(self._on_category_changed)
+        self._field_widgets["product_category"] = combo
+        self._form.addRow("Product Category", combo)
+
+    def _on_category_changed(self, category: str):
+        lot_w = self._field_widgets.get("lot_number")
+        if not lot_w:
+            return
+        if category == "Botanical":
+            name_w = self._field_widgets.get("product_name")
+            date_w = self._field_widgets.get("manufacturing_date")
+            if not (name_w and date_w):
+                return
+            new_batch_no = generate_batch_number(name_w.text().strip(), date_w.text().strip(), "Botanical")
+            if new_batch_no:
+                lot_w.setText(new_batch_no)
+        elif self._supplier_batch_no:
+            lot_w.setText(self._supplier_batch_no)
+
     def _add_disposition_row(self):
         combo = QComboBox()
         for d in Disposition:
@@ -189,17 +223,13 @@ class ReviewScreen(QWidget):
         row = self._table.rowCount()
         self._table.insertRow(row)
 
-        cat_combo = QComboBox()
-        for c in TestCategory:
-            cat_combo.addItem(c.value)
-
         pf_combo = QComboBox()
         for p in PassFail:
             pf_combo.addItem(p.value)
 
         cols = [
             QTableWidgetItem(tr.test_name if tr else ""),
-            None,  # combo — set below
+            None,  # category — set below (combo or plain text)
             QTableWidgetItem(tr.specification if tr else ""),
             QTableWidgetItem(tr.result if tr else ""),
             QTableWidgetItem(tr.unit if tr else ""),
@@ -212,15 +242,30 @@ class ReviewScreen(QWidget):
                 continue
             self._table.setItem(row, col, item)
 
+        if tr and tr.category_label:
+            # Supplier-extracted rows show the raw category text as plain,
+            # editable text — no dropdown.
+            self._table.setItem(row, 1, QTableWidgetItem(tr.category_label))
+        else:
+            # Rows with no category label (e.g. a freshly added row) get the
+            # 4-bucket dropdown instead. A blank option comes first so rows
+            # that genuinely have no category (e.g. a supplier's unlabelled
+            # "Ratio" row) don't get silently defaulted to "Physical".
+            cat_combo = QComboBox()
+            cat_combo.addItem("")
+            for c in TestCategory:
+                cat_combo.addItem(c.value)
+            if tr and tr.category:
+                idx = cat_combo.findText(tr.category)
+                if idx >= 0:
+                    cat_combo.setCurrentIndex(idx)
+            self._table.setCellWidget(row, 1, cat_combo)
+
         if tr:
-            idx = cat_combo.findText(tr.category)
-            if idx >= 0:
-                cat_combo.setCurrentIndex(idx)
             idx2 = pf_combo.findText(tr.pass_fail)
             if idx2 >= 0:
                 pf_combo.setCurrentIndex(idx2)
 
-        self._table.setCellWidget(row, 1, cat_combo)
         self._table.setCellWidget(row, 6, pf_combo)
         self._table.setRowHeight(row, 30)
 
@@ -242,6 +287,7 @@ class ReviewScreen(QWidget):
     def load(self, doc: COADocument, conf: FieldConfidence):
         self._doc = doc
         self._conf = conf
+        self._supplier_batch_no = doc.supplier_batch_number
 
         # Populate header fields
         for field_key, widget in self._field_widgets.items():
@@ -273,6 +319,8 @@ class ReviewScreen(QWidget):
             elif isinstance(widget, QComboBox):
                 setattr(doc, field_key, widget.currentText())
 
+        doc.supplier_batch_number = self._supplier_batch_no
+
         # Collect test results
         results: list[TestResult] = []
         for row in range(self._table.rowCount()):
@@ -283,9 +331,11 @@ class ReviewScreen(QWidget):
                 w = self._table.cellWidget(row, col)
                 return w.currentText() if w else ""
 
+            has_combo = self._table.cellWidget(row, 1) is not None
             tr = TestResult(
                 test_name=cell(0),
-                category=combo_val(1),
+                category=combo_val(1) if has_combo else "",
+                category_label="" if has_combo else cell(1),
                 specification=cell(2),
                 result=cell(3),
                 unit=cell(4),

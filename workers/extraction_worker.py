@@ -7,7 +7,10 @@ from __future__ import annotations
 import os
 from PyQt6.QtCore import QThread, pyqtSignal
 from core.coa_model import COADocument
-from core.field_mapper import FieldConfidence, map_from_text, map_from_tables, merge_documents
+from core.field_mapper import (
+    FieldConfidence, map_from_text, map_from_tables, merge_documents,
+    apply_structured_extraction, apply_fallbacks,
+)
 
 
 class ExtractionWorker(QThread):
@@ -42,10 +45,21 @@ class ExtractionWorker(QThread):
             self.progress.emit(98)
 
             # Map test results from tables (higher confidence)
-            table_results, table_conf = map_from_tables(parsed.tables)
+            table_results, table_conf, table_header_fields = map_from_tables(parsed.tables)
 
             # Merge
-            final_doc, final_conf = merge_documents(text_doc, text_conf, table_results, table_conf)
+            final_doc, final_conf = merge_documents(
+                text_doc, text_conf, table_results, table_conf, table_header_fields
+            )
+
+            # Position-based structured extraction (borderless industry-standard
+            # COA layout) takes priority over the regex/table path when detected.
+            structured = getattr(parsed, "structured", None)
+            if structured:
+                final_doc, final_conf = apply_structured_extraction(final_doc, final_conf, structured)
+
+            final_doc, final_conf = apply_fallbacks(final_doc, final_conf, parsed.text)
+
             self.progress.emit(100)
             self.finished.emit(final_doc, final_conf)
 

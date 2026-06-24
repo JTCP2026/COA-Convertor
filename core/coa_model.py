@@ -28,6 +28,10 @@ class TestCategory(str, Enum):
 class TestResult:
     test_name: str = ""
     category: str = TestCategory.PHYSICAL.value
+    # Raw category banner text as it appeared in the supplier's own document
+    # (e.g. "Organoleptic properties"). Optional — when present, generators
+    # display this verbatim instead of the generic `category` bucket label.
+    category_label: str = ""
     specification: str = ""
     result: str = ""
     unit: str = ""
@@ -44,6 +48,11 @@ class COADocument:
     internal_item_code: str = ""
     supplier_product_code: str = ""
     lot_number: str = ""
+    # Raw batch no. as it appeared in the supplier's document — preserved
+    # separately so switching product_category away from Botanical can
+    # restore it (lot_number itself may get overwritten by the generated
+    # Botanical batch number).
+    supplier_batch_number: str = ""
     quantity_received: str = ""
     purchase_order_number: str = ""
 
@@ -52,6 +61,11 @@ class COADocument:
     manufacturer_address: str = ""
     manufacturer_country: str = ""
     supplier_name: str = ""
+
+    # Product classification (drives batch-number generation logic)
+    product_category: str = ""  # Botanical / Vitamins / Amino Acids / Mineral
+    botanical_name: str = ""
+    plant_part: str = ""
 
     # Dates
     manufacturing_date: str = ""
@@ -63,7 +77,7 @@ class COADocument:
     test_results: list[TestResult] = field(default_factory=list)
 
     # Release / QC
-    overall_disposition: str = Disposition.PENDING.value
+    overall_disposition: str = Disposition.PASS.value
     qc_release_statement: str = ""
     authorised_signatory_name: str = ""
     authorised_signatory_title: str = ""
@@ -72,6 +86,8 @@ class COADocument:
     # Receiving company (from config — populated at generation time)
     receiving_company_name: str = ""
     receiving_company_address: str = ""
+    receiving_company_phone: str = ""
+    receiving_company_website: str = ""
     receiving_company_logo_path: str = ""
     receiving_company_header_path: str = ""
 
@@ -79,7 +95,6 @@ class COADocument:
         "product_name",
         "lot_number",
         "date_of_analysis",
-        "manufacturer_name",
     ]
 
     def validate(self) -> list[str]:
@@ -89,6 +104,55 @@ class COADocument:
             if not getattr(self, f, "").strip():
                 missing.append(f)
         return missing
+
+
+def build_display_rows(
+    test_results: list[TestResult],
+    category_labels: dict[str, str],
+) -> list[tuple[str, object]]:
+    """
+    Build a flat render sequence for the test-results table: a band row
+    whenever the category label changes from the previous row, followed by
+    the data row. Rows with no category at all (both `category` and
+    `category_label` left blank — e.g. a supplier's unlabelled "Ratio" row)
+    render with no preceding band. Rows using the legacy `category` enum
+    (the common case for manually-entered results) still get a band from
+    `category_labels`.
+
+    Returns a list of ("band", label_str) and ("row", TestResult) tuples.
+    """
+    rows: list[tuple[str, object]] = []
+    prev_label: str | None = None
+    for tr in test_results:
+        if tr.category_label:
+            label = tr.category_label
+        elif tr.category:
+            label = category_labels.get(tr.category, tr.category)
+        else:
+            label = ""
+        label = (label or "").strip()
+        if label and label != prev_label:
+            rows.append(("band", label))
+            prev_label = label
+        elif not label:
+            prev_label = None
+        rows.append(("row", tr))
+    return rows
+
+
+def fit_scale(n_rows: int) -> float:
+    """Best-effort scale factor (shared by both generators) to keep the COA
+    on a single page as the test-results row count grows. Not a guaranteed
+    fit — extremely long tables may still overflow even at the floor scale."""
+    if n_rows <= 18:
+        return 1.0
+    if n_rows <= 25:
+        return 0.92
+    if n_rows <= 32:
+        return 0.85
+    if n_rows <= 40:
+        return 0.78
+    return 0.75
 
 
 # Maps field name → human-readable label
@@ -105,6 +169,9 @@ FIELD_LABELS: dict[str, str] = {
     "manufacturer_address": "Manufacturer Address",
     "manufacturer_country": "Country of Origin",
     "supplier_name": "Supplier Name",
+    "product_category": "Product Category",
+    "botanical_name": "Botanical Name",
+    "plant_part": "Plant Part",
     "manufacturing_date": "Manufacturing Date",
     "expiry_date": "Expiry Date",
     "retest_date": "Retest Date",

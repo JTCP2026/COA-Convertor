@@ -5,6 +5,7 @@ Returns (COADocument, FieldConfidence dict).
 """
 from __future__ import annotations
 import re
+from datetime import datetime
 from typing import Any
 from dateutil import parser as dateutil_parser
 from .coa_model import COADocument, TestResult, PassFail, TestCategory
@@ -30,7 +31,7 @@ _DATE_FRAG = (
     r'(\d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{2,4}'
     r'|\d{4}[/\-\.]\d{1,2}[/\-\.]\d{1,2}'
     r'|\d{4}[年/]\d{1,2}[月/]\d{1,2}日?'
-    r'|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[\s\-,\.]\d{1,2}[\s,\.]\d{4}'
+    r'|(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[\s\-,\.]+\d{1,2}[\s,\.]+\d{4}'
     r'|\d{8})'
 )
 
@@ -83,12 +84,12 @@ _PO_NUMBER = _build([
 ])
 
 _QUANTITY = _build([
-    r'(?:quantity|qty\.?|amount|weight|volume|net[\s_-]*weight|gross[\s_-]*weight)[\s_-]*(?:received)?\s*[:#\-]?\s*(\d[\d,\.]*\s*(?:kg|g|mg|lb|lbs|l|ml|L|mL|units?|pcs?|bags?|drums?))',
-    r'(?:数量|重量|净重|毛重|体积|容量)[\s_-]*(?:收货)?\s*[：:]\s*(\d[\d,\.]*\s*(?:千克|公斤|克|毫克|升|毫升|件|包|桶))',
+    r'(?:quantity|qty\.?|amount|weight|volume|net[\s_-]*weight|gross[\s_-]*weight)[\s_-]*(?:received)?\s*[:#\-]?\s*(\d[\d,\.]*\s*(?:kg|g|mg|lb|lbs|l|ml|L|mL|units?|pcs?|bags?|drums?)?)',
+    r'(?:数量|重量|净重|毛重|体积|容量)[\s_-]*(?:收货)?\s*[：:]\s*(\d[\d,\.]*\s*(?:千克|公斤|克|毫克|升|毫升|件|包|桶)?)',
 ])
 
 _COUNTRY = _build([
-    r'(?:country[\s_-]*of[\s_-]*(?:origin|manufacture|manufacturing)|origin)\s*[:#\-]?\s*([A-Za-z一-鿿]{2,50})',
+    r'(?:country[\s_-]*of[\s_-]*(?:origin|manufacture|manufacturing)|\borigin\b)\s*[:#\-]?\s*([A-Za-z一-鿿]{2,50})',
     r'(?:原产地|原产国|生产国|制造国|产地)\s*[：:]\s*([A-Za-z一-鿿]{2,20})',
 ])
 
@@ -103,16 +104,69 @@ _FAIL_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Table header keywords for column detection
+# Table header keywords for column detection. Kept in sync with
+# _TABLE_HEADER_CANDIDATES below so the position-based and table-based
+# extraction paths recognize the same set of header-wording variants.
 _TABLE_HEADER_KEYWORDS = {
-    "test_name": ["test", "parameter", "item", "检验项目", "项目", "检测项目", "测试项目", "指标"],
-    "specification": ["specification", "spec", "standard", "requirement", "limit", "规格", "标准", "指标", "限度", "质量标准"],
+    "test_name": ["test", "parameter", "item", "attribute", "检验项目", "项目", "检测项目", "测试项目", "指标"],
+    "specification": ["specification", "spec", "standard", "requirement", "limit", "acceptance criteria", "规格", "标准", "指标", "限度", "质量标准"],
     "result": ["result", "value", "found", "actual", "observed", "结果", "测定值", "实测值", "检测结果"],
-    "method": ["method", "procedure", "standard", "方法", "检验方法", "检测方法", "依据"],
+    "method": ["method", "procedure", "standard", "reference", "方法", "检验方法", "检测方法", "依据"],
     "pass_fail": ["pass", "fail", "conform", "status", "判定", "结论", "合格"],
     "unit": ["unit", "units", "单位"],
     "category": ["category", "type", "类别", "类型"],
 }
+
+# ---------------------------------------------------------------------------
+# Shared label-keyword matching — used both by pdf_parser's position-based
+# structured extractor (borderless layouts) and by map_from_tables() below
+# (ruled-line tables where a product-info grid sits above the test-results
+# table within the same pdfplumber table). Keyword-based, not exact-phrase,
+# so differently-worded supplier templates still resolve to the right field.
+# ---------------------------------------------------------------------------
+_GRID_LABEL_KEYWORDS: dict[str, list[str]] = {
+    "retest_date": ["re-test date", "retest date", "re test date"],
+    "manufacturing_date": ["production date", "manufacturing date", "manufacture date", "mfg date", "date of manufacture"],
+    "date_of_analysis": ["analysis date", "date of analysis", "date analyzed"],
+    "botanical_name": ["botanical name", "botanical", "plant source"],
+    "plant_part": ["plant part", "part used", "used part"],
+    "manufacturer_country": ["country of origin", "country", "origin"],
+    "lot_number": ["batch number", "batch no", "lot number", "lot no", "batch", "lot"],
+    "quantity_received": ["quantity received", "quantity", "qty"],
+    "product_name": ["product name", "item name", "ingredient name", "material name"],
+}
+
+_TABLE_HEADER_CANDIDATES = [
+    {"analysis item", "test item", "test name", "item", "test", "parameter", "attribute"},
+    {"specification", "spec", "limit", "standard", "acceptance criteria"},
+    {"result", "value", "found", "test result", "results"},
+    {"method", "test method", "analysis test method", "procedure", "reference", "analysis method"},
+]
+
+
+def match_grid_label(text: str) -> str | None:
+    """Match a header-grid label phrase to a COADocument field name."""
+    norm = text.strip().lower().rstrip(".").strip()
+    # Section dividers like "Product information" / "Batch information" are
+    # not actual label:value lines — exclude them before keyword matching.
+    if re.fullmatch(r"[a-z]+\s+information", norm):
+        return None
+    if re.search(r"product\s*code|item\s*code|\bsku\b", norm):
+        return "supplier_product_code"
+    for field_name, keywords in _GRID_LABEL_KEYWORDS.items():
+        for kw in keywords:
+            if re.search(rf"\b{re.escape(kw)}\b", norm):
+                return field_name
+    return None
+
+
+def match_header_col(text: str) -> int | None:
+    """Return which of the 4 analysis-table header columns this text is, if any."""
+    norm = text.strip().lower().rstrip(".").strip()
+    for col_i, candidates in enumerate(_TABLE_HEADER_CANDIDATES):
+        if norm in candidates:
+            return col_i
+    return None
 
 
 def _first_match(pattern: re.Pattern, text: str) -> tuple[str, float]:
@@ -126,17 +180,100 @@ def _first_match(pattern: re.Pattern, text: str) -> tuple[str, float]:
     return "", 0.0
 
 
+def generate_batch_number(product_name: str, production_date: str, category: str) -> str:
+    """
+    Auto-generate the Batch No. for Botanical-category products from the
+    product name initials + production date (YYYYMMDD).
+
+    Rule (derived from Navi Nature's existing naming convention):
+      - >=3 words  -> first letter of each of the first 3 words (extra words ignored)
+      - 2 words    -> first 2 letters of word 1 + first letter of word 2
+      - 1 word     -> first 3 letters of that word
+    Non-Botanical categories pass the supplier's own batch number through unchanged
+    (this function should not be called for those — see caller).
+    """
+    if category != "Botanical":
+        return ""
+
+    words = [w for w in re.split(r"\s+", (product_name or "").strip()) if w]
+    if len(words) >= 3:
+        acronym = "".join(w[0] for w in words[:3])
+    elif len(words) == 2:
+        acronym = words[0][:2] + words[1][0]
+    elif len(words) == 1:
+        acronym = words[0][:3]
+    else:
+        acronym = ""
+    acronym = acronym.upper()
+
+    date_digits = _date_to_yyyymmdd(production_date)
+
+    return f"{acronym}{date_digits}"
+
+
+_MONTH_NAME_RE = re.compile(
+    r'\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\b', re.IGNORECASE
+)
+
+
+def _parse_date_obj(raw: str) -> datetime | None:
+    """
+    Parse a date string in any common format, resolving day/month ambiguity
+    sensibly:
+      1. Unambiguous ISO YYYY-MM-DD / YYYY/MM/DD parsed directly (no guessing)
+      2. Formats with an English month name are unambiguous regardless of
+         day/month order (e.g. "Jan-14-2025", "Jan. 14 2025")
+      3. Purely numeric dates (e.g. "03/04/2024") are ambiguous — try US
+         (month-first) first, falling back to day-first if that's invalid
+         (e.g. the first number is > 12, so it can't be a month)
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+
+    m = re.match(r'^(\d{4})[/\-.](\d{1,2})[/\-.](\d{1,2})$', raw)
+    if m:
+        try:
+            dt = datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            if 1990 <= dt.year <= 2050:
+                return dt
+        except ValueError:
+            pass
+
+    if _MONTH_NAME_RE.search(raw):
+        try:
+            dt = dateutil_parser.parse(raw)
+            if 1990 <= dt.year <= 2050:
+                return dt
+        except Exception:
+            pass
+        return None
+
+    for dayfirst in (False, True):
+        try:
+            dt = dateutil_parser.parse(raw, dayfirst=dayfirst)
+            if 1990 <= dt.year <= 2050:
+                return dt
+        except Exception:
+            continue
+    return None
+
+
+def _date_to_yyyymmdd(raw: str) -> str:
+    """Used for batch-number generation — independent of the display format."""
+    dt = _parse_date_obj(raw)
+    if dt:
+        return dt.strftime("%Y%m%d")
+    return re.sub(r"[^0-9]", "", raw or "")
+
+
 def _parse_date(raw: str) -> str:
-    """Normalise any date string to YYYY-MM-DD. Returns raw on failure."""
-    raw = raw.strip()
-    try:
-        dt = dateutil_parser.parse(raw, dayfirst=True)
-        # Sanity check
-        if 1990 <= dt.year <= 2050:
-            return dt.strftime("%Y-%m-%d")
-    except Exception:
-        pass
-    return raw
+    """Normalise any date string to US format MM/DD/YYYY. Returns the
+    original string unchanged on failure."""
+    dt = _parse_date_obj(raw)
+    if dt:
+        return dt.strftime("%m/%d/%Y")
+    return (raw or "").strip()
 
 
 def _score_header_row(cells: list[str]) -> dict[str, int]:
@@ -179,27 +316,74 @@ def _detect_category(test_name: str) -> str:
     return TestCategory.PHYSICAL.value
 
 
-def map_from_tables(tables: list[list[list[str]]]) -> tuple[list[TestResult], float]:
-    """Extract TestResult list from structured tables. Returns (results, confidence)."""
+def _fix_concatenated_words(s: str) -> str:
+    """pdfplumber sometimes drops the space between words when reconstructing
+    cell text (e.g. "CordycepsMilitaris", "YellowBrown Powder"). Insert a
+    space at lowercase->uppercase boundaries to undo it. All-caps text
+    (abbreviations like "USP", "TLC") has no such boundary and is untouched."""
+    return re.sub(r"(?<=[a-z])(?=[A-Z])", " ", s)
+
+
+def map_from_tables(tables: list[list[list[str]]]) -> tuple[list[TestResult], float, dict[str, str]]:
+    """
+    Extract TestResult list from structured (pdfplumber) tables. The real
+    header row is located anywhere in the table — not assumed to be row 0 —
+    because some supplier templates put a product-info grid (Product Name /
+    Batch / ...) inside the very same ruled-line table, above the test
+    header row. Rows before the header are parsed as that grid (label/value
+    pairs); rows after are the test-result data, with single-cell rows
+    treated as category banners (category_label) rather than fake results.
+
+    Returns (results, confidence, header_fields).
+    """
     results: list[TestResult] = []
+    header_fields: dict[str, str] = {}
     best_conf = 0.0
 
     for table in tables:
         if len(table) < 2:
             continue
-        header_row = [str(c) for c in table[0]]
-        col_map = _score_header_row(header_row)
-        if "test_name" not in col_map and "result" not in col_map:
+
+        # Require >=2 matched columns before accepting a row as the real
+        # header — a single keyword can false-positive (e.g. "Retest Date:"
+        # contains the substring "test", which alone would wrongly look
+        # like a test_name column).
+        header_idx = None
+        col_map: dict[str, int] = {}
+        for i, row in enumerate(table):
+            cells = [str(c) if c else "" for c in row]
+            candidate_map = _score_header_row(cells)
+            if len(candidate_map) >= 2 and ("test_name" in candidate_map or "result" in candidate_map):
+                header_idx = i
+                col_map = candidate_map
+                break
+        if header_idx is None:
             continue
 
         conf = 0.95 if len(col_map) >= 3 else 0.70
         best_conf = max(best_conf, conf)
 
-        for row in table[1:]:
-            cells = [str(c).strip() if c else "" for c in row]
-            if not any(cells):
+        # Rows before the header: a product-info grid, if present.
+        for row in table[:header_idx]:
+            cells = [_fix_concatenated_words(str(c).strip()) if c else "" for c in row]
+            n = len(cells)
+            pairs = [(0, 1), (2, 3)] if n >= 4 else ([(0, 1)] if n >= 2 else [])
+            for label_i, value_i in pairs:
+                field_name = match_grid_label(cells[label_i])
+                if field_name and cells[value_i]:
+                    header_fields[field_name] = cells[value_i]
+
+        current_band = ""
+        for row in table[header_idx + 1:]:
+            cells = [_fix_concatenated_words(str(c).strip()) if c else "" for c in row]
+            non_empty = [c for c in cells if c]
+            if not non_empty:
                 continue
-            tr = TestResult()
+            if len(non_empty) == 1 and cells[0]:
+                # Category banner row (only column 0 filled)
+                current_band = cells[0]
+                continue
+            tr = TestResult(category_label=current_band, category="")
             if "test_name" in col_map and col_map["test_name"] < len(cells):
                 tr.test_name = cells[col_map["test_name"]]
             if "specification" in col_map and col_map["specification"] < len(cells):
@@ -214,11 +398,10 @@ def map_from_tables(tables: list[list[list[str]]]) -> tuple[list[TestResult], fl
                 tr.pass_fail = _infer_pass_fail(cells[col_map["pass_fail"]])
             elif tr.result:
                 tr.pass_fail = _infer_pass_fail(tr.result)
-            tr.category = _detect_category(tr.test_name)
             if tr.test_name or tr.result:
                 results.append(tr)
 
-    return results, best_conf
+    return results, best_conf, header_fields
 
 
 def map_from_text(text: str, extra_aliases: dict | None = None) -> tuple[COADocument, FieldConfidence]:
@@ -268,17 +451,158 @@ def map_from_text(text: str, extra_aliases: dict | None = None) -> tuple[COADocu
     return doc, conf
 
 
+# ---------------------------------------------------------------------------
+# Category keyword detection — used when the document has no dedicated
+# "Botanical name"-style field to key off of (see apply_structured_extraction
+# for that more reliable signal).
+# ---------------------------------------------------------------------------
+_CATEGORY_KEYWORDS: dict[str, list[str]] = {
+    "Botanical": ["botanical", "plant", "herb", "leaf", "leaves", "root", "fruit",
+                  "flower", "seed", "bark", "rhizome", "extract"],
+    "Vitamins": ["vitamin", "tocopherol", "ascorbic", "retinol", "cholecalciferol",
+                 "riboflavin", "niacin", "biotin", "folate", "pyridoxine",
+                 "thiamine", "cobalamin"],
+    "Amino Acids": ["amino acid", "lysine", "leucine", "glutamine", "taurine",
+                     "arginine", "glycine", "alanine", "tryptophan", "methionine",
+                     "proline", "threonine", "valine", "isoleucine",
+                     "phenylalanine", "histidine", "cysteine", "tyrosine", "serine"],
+    "Mineral": ["mineral", "calcium", "magnesium", "zinc", "iron", "selenium",
+                "chromium", "potassium", "manganese", "copper", "citrate",
+                "gluconate", "carbonate", "sulfate"],
+}
+
+
+def detect_product_category(full_text: str, product_name: str = "") -> str:
+    """Scan document text for category-indicative keywords. Checked in
+    Botanical -> Vitamins -> Amino Acids -> Mineral order; returns "" if
+    nothing matches."""
+    haystack = f"{product_name or ''} {full_text or ''}".lower()
+    for category, keywords in _CATEGORY_KEYWORDS.items():
+        for kw in keywords:
+            if re.search(rf'\b{re.escape(kw)}\b', haystack):
+                return category
+    return ""
+
+
+def apply_fallbacks(
+    doc: COADocument,
+    conf: FieldConfidence,
+    full_text: str = "",
+) -> tuple[COADocument, FieldConfidence]:
+    """Post-processing fallbacks applied once after all extraction paths
+    have run: Date of Analysis defaults to the manufacturing date when the
+    supplier's document doesn't state it separately, and product_category
+    gets a best-effort keyword-based guess when nothing set it already."""
+    if not doc.date_of_analysis and doc.manufacturing_date:
+        doc.date_of_analysis = doc.manufacturing_date
+        conf["date_of_analysis"] = 0.5
+
+    if not doc.product_category:
+        category = detect_product_category(full_text, doc.product_name)
+        if category:
+            doc.product_category = category
+            conf["product_category"] = 0.6
+            if category == "Botanical":
+                if not doc.supplier_batch_number:
+                    doc.supplier_batch_number = doc.lot_number
+                new_batch = generate_batch_number(doc.product_name, doc.manufacturing_date, "Botanical")
+                if new_batch:
+                    doc.lot_number = new_batch
+                    conf["lot_number"] = 0.6
+
+    return doc, conf
+
+
+def apply_structured_extraction(
+    doc: COADocument,
+    conf: FieldConfidence,
+    structured: dict,
+) -> tuple[COADocument, FieldConfidence]:
+    """
+    Override header fields and test_results with a position-based structured
+    extraction result (see pdf_parser._extract_structured_coa). This takes
+    priority over the regex/pdfplumber path since it's anchored to the
+    document's actual layout rather than free-text pattern matching.
+
+    Auto-detects the Botanical product category when a `botanical_name` was
+    found, and immediately regenerates the Batch No. for that case.
+    """
+    _DATE_FIELDS = {"manufacturing_date", "date_of_analysis", "retest_date", "expiry_date"}
+
+    header_fields = structured.get("header_fields", {})
+    for field_name, value in header_fields.items():
+        if value:
+            if field_name in _DATE_FIELDS:
+                value = _parse_date(value)
+            setattr(doc, field_name, value)
+            conf[field_name] = 0.95
+
+    if header_fields.get("lot_number"):
+        doc.supplier_batch_number = header_fields["lot_number"]
+
+    raw_results = structured.get("test_results", [])
+    if raw_results:
+        doc.test_results = [
+            TestResult(
+                test_name=r.get("test_name", ""),
+                category_label=r.get("category_label", ""),
+                category="",
+                specification=r.get("specification", ""),
+                result=r.get("result", ""),
+                method=r.get("method", ""),
+                pass_fail=_infer_pass_fail(r.get("result", "")),
+            )
+            for r in raw_results
+        ]
+        conf["test_results"] = 0.95
+
+    if doc.botanical_name:
+        doc.product_category = "Botanical"
+        doc.lot_number = generate_batch_number(doc.product_name, doc.manufacturing_date, "Botanical")
+        conf["product_category"] = 0.9
+        conf["lot_number"] = 0.9
+
+    return doc, conf
+
+
+_DATE_FIELDS = {"manufacturing_date", "date_of_analysis", "retest_date", "expiry_date"}
+
+# pdfplumber's per-cell text is immune to the PDF reading-order glitches that
+# can corrupt the flattened-text regex path (see lot_number "Batch" row
+# reordering), so always prefer it for these fields. For everything else,
+# pdfplumber sometimes drops spaces between words in its cell text — so the
+# table value is only used to fill a gap, not to override a regex value
+# that's already there.
+_FIELDS_PREFER_TABLE = {"lot_number", "quantity_received"}
+
+
 def merge_documents(
     text_doc: COADocument,
     text_conf: FieldConfidence,
     table_results: list[TestResult],
     table_conf: float,
+    table_header_fields: dict[str, str] | None = None,
 ) -> tuple[COADocument, FieldConfidence]:
     """
-    Merge text-extracted header fields with table-extracted test results.
-    Boosts confidence when both sources agree.
+    Merge text-extracted header fields with table-extracted test results
+    and (when present) a product-info grid found inside the same
+    ruled-line table.
     """
     text_doc.test_results = table_results
     if table_results:
         text_conf["test_results"] = table_conf
+
+    for field_name, value in (table_header_fields or {}).items():
+        if not value:
+            continue
+        if field_name in _DATE_FIELDS:
+            value = _parse_date(value)
+        if field_name == "lot_number":
+            text_doc.supplier_batch_number = value
+        existing = getattr(text_doc, field_name, "")
+        if existing and field_name not in _FIELDS_PREFER_TABLE:
+            continue
+        setattr(text_doc, field_name, value)
+        text_conf[field_name] = 0.9
+
     return text_doc, text_conf

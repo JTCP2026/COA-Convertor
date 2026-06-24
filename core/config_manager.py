@@ -27,6 +27,7 @@ class CompanyConfig:
     signatory_title: str = "Quality Control Manager"
     cert_prefix: str = "COA"
     cert_counter: int = 1
+    default_export_folder: str = ""
     custom_aliases: dict = field(default_factory=dict)
     supplier_templates: dict = field(default_factory=dict)
 

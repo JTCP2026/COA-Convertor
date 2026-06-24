@@ -22,6 +22,7 @@ from views.styles import QSS
 
 def main():
     app = QApplication(sys.argv)
+    app.setStyle("Fusion")
     app.setApplicationName("COA Converter")
     app.setOrganizationName("COAConverter")
     app.setStyleSheet(QSS)

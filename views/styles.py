@@ -9,6 +9,7 @@ QWidget {
     font-family: "Segoe UI", Arial, sans-serif;
     font-size: 13px;
     color: #222222;
+    background-color: #FFFFFF;
 }
 
 /* ── Sidebar ─────────────────────────────────────────────── */

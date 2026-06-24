@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from core.coa_model import COADocument, FIELD_LABELS
-from core.config_manager import load_config, next_cert_number
+from core.config_manager import load_config, save_config, next_cert_number
 from datetime import date
 
 
@@ -57,6 +57,18 @@ class ExportScreen(QWidget):
         self._disp_banner.setStyleSheet("font-size:15px; font-weight:bold; border-radius:6px;")
         layout.addWidget(self._disp_banner)
 
+        # Default save folder
+        folder_group = QGroupBox("Default Save Folder")
+        folder_layout = QHBoxLayout(folder_group)
+        self._folder_label = QLabel("Not set — will ask each time")
+        self._folder_label.setWordWrap(True)
+        folder_change_btn = QPushButton("Change...")
+        folder_change_btn.setObjectName("SecondaryBtn")
+        folder_change_btn.clicked.connect(self._change_default_folder)
+        folder_layout.addWidget(self._folder_label, 1)
+        folder_layout.addWidget(folder_change_btn)
+        layout.addWidget(folder_group)
+
         # Export buttons
         export_group = QGroupBox("Export Options")
         export_layout = QHBoxLayout(export_group)
@@ -100,6 +112,14 @@ class ExportScreen(QWidget):
     def load(self, doc: COADocument):
         cfg = load_config()
 
+        # Default save folder: use the configured one if it still exists,
+        # otherwise fall back to the home directory.
+        if cfg.default_export_folder and os.path.isdir(cfg.default_export_folder):
+            self._last_output_dir = cfg.default_export_folder
+            self._folder_label.setText(cfg.default_export_folder)
+        else:
+            self._folder_label.setText("Not set — will ask each time")
+
         # Auto-assign cert number if missing
         if not doc.certificate_number:
             doc.certificate_number = next_cert_number(cfg)
@@ -109,6 +129,8 @@ class ExportScreen(QWidget):
         # Fill from company config
         doc.receiving_company_name = cfg.company_name
         doc.receiving_company_address = cfg.address
+        doc.receiving_company_phone = cfg.phone
+        doc.receiving_company_website = cfg.website
         doc.receiving_company_logo_path = cfg.logo_path
         doc.receiving_company_header_path = cfg.header_path
         if not doc.qc_release_statement:
@@ -148,11 +170,25 @@ class ExportScreen(QWidget):
         self._export_status.setText("")
         self._open_folder_btn.setEnabled(False)
 
+    def _change_default_folder(self):
+        start_dir = self._last_output_dir if os.path.isdir(self._last_output_dir) else os.path.expanduser("~")
+        folder = QFileDialog.getExistingDirectory(self, "Choose Default Save Folder", start_dir)
+        if not folder:
+            return
+        cfg = load_config()
+        cfg.default_export_folder = folder
+        save_config(cfg)
+        self._last_output_dir = folder
+        self._folder_label.setText(folder)
+
+    def _default_filename(self, ext: str) -> str:
+        company = (self._doc.receiving_company_name or "").upper()
+        return f"{company}-{self._doc.product_name or 'output'}-{self._doc.lot_number or ''}-COA.{ext}"
+
     def _export_pdf(self):
         if not self._doc:
             return
-        default_name = f"COA_{self._doc.product_name or 'output'}_{self._doc.lot_number or ''}.pdf"
-        default_name = default_name.replace(" ", "_")
+        default_name = self._default_filename("pdf")
         path, _ = QFileDialog.getSaveFileName(
             self, "Save PDF", os.path.join(self._last_output_dir, default_name),
             "PDF Files (*.pdf)"
@@ -173,8 +209,7 @@ class ExportScreen(QWidget):
     def _export_docx(self):
         if not self._doc:
             return
-        default_name = f"COA_{self._doc.product_name or 'output'}_{self._doc.lot_number or ''}.docx"
-        default_name = default_name.replace(" ", "_")
+        default_name = self._default_filename("docx")
         path, _ = QFileDialog.getSaveFileName(
             self, "Save Word Document", os.path.join(self._last_output_dir, default_name),
             "Word Documents (*.docx)"
